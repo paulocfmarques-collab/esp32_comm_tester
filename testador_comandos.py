@@ -1,8 +1,9 @@
-"""GUI UDP e serial para testar comandos do ESP32."""
+"""GUI UDP, serial e Bluetooth SPP para testar comandos do ESP32."""
 
 from __future__ import annotations
 
 import argparse
+import re
 
 try:
     import serial
@@ -40,6 +41,7 @@ COMMANDS = [
     CommandSpec("status", "Sistema", "Estado do Wi-Fi, NTP e memória."),
     CommandSpec("uptime", "Sistema", "Tempo desde a inicialização."),
     CommandSpec("reason", "Sistema", "Motivo do último reset."),
+    CommandSpec("crash_info", "Sistema", "Resumo do core dump salvo na Central."),
     CommandSpec("version", "Sistema", "Versão do firmware."),
     CommandSpec("build", "Sistema", "Data e hora da compilação."),
     CommandSpec("alive", "Sistema", "Verifica a resposta básica da rede."),
@@ -114,7 +116,180 @@ COMMANDS = [
 ]
 
 COMMAND_BY_NAME = {spec.name: spec for spec in COMMANDS}
-GROUPS = ("Sistema", "Rede", "Horário", "LED", "SD", "Clima", "Central")
+DEVICE_COMMANDS = {
+    "ESP32_Central": [
+        "help", "name", "info", "status", "reason", "crash_info", "version", "build",
+        "uptime", "lastcmd", "cmdcount", "vago", "reboot", "reset_wifi", "desligar",
+        "cpu", "ram", "flash", "temp", "psram", "mac", "net_info", "scan", "time",
+        "date", "set_fuso", "led_on", "led_off", "led_blink", "set_escravo1",
+        "set_escravo2", "set_escravo3", "set_escravo4", "sd_status", "sd_test",
+        "sd_log", "sd_remount", "sd_list", "sd_read", "sd_write", "sd_append", "sd_del",
+        "sd_mkdir", "sd_rmdir", "sd_clear_log",
+    ],
+}
+
+COMMAND_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9_]*)"
+    r"(?::(\[[^\]]*\]|[A-Za-z0-9_.|,+-]+(?::[A-Za-z0-9_.|,+-]+)*))?"
+)
+HELP_CATEGORIES = {
+    "clima", "diagnostico", "diagnóstico", "hardware", "hora", "horario",
+    "led", "network", "oled", "outros", "rede", "sd", "screen", "sistema",
+    "system", "tela",
+}
+HELP_NON_COMMANDS = {
+    "ate", "baud", "cada", "canais", "com", "comando", "comandos", "disponiveis",
+    "disponíveis", "ex", "finalize", "ota", "respostas", "serial", "udp",
+}
+COMMAND_CONFIRMATIONS = {
+    "clear": "Apagar os dados do dispositivo?",
+    "clear_log": "Apagar os logs do dispositivo?",
+    "delete": "Apagar o item selecionado?",
+    "deep_sleep": "Colocar o dispositivo em sono profundo?",
+    "erase": "Apagar os dados do dispositivo?",
+    "factory_reset": "Restaurar o dispositivo para as configurações de fábrica?",
+    "format": "Formatar o armazenamento do dispositivo?",
+    "reboot": "Reiniciar o dispositivo?",
+    "reset": "Reiniciar o dispositivo?",
+    "shutdown": "Desligar o dispositivo?",
+    "sleep": "Colocar o dispositivo em sono profundo?",
+    "wifi_add": "Salvar ou atualizar uma rede Wi-Fi no dispositivo?",
+    "wifi_clear": "Apagar as redes Wi-Fi salvas?",
+}
+
+
+def parse_device_identity(name_response: str) -> str:
+    for raw_line in name_response.splitlines():
+        identity = raw_line.strip()
+        if not identity or identity.startswith((">", "[RESPOSTA]", "[FIM RESPOSTA]")):
+            continue
+        if re.search(
+            r"(?i)(comando .+ (?:desconhecido|não reconhecido|nao reconhecido)|"
+            r"unknown command|command .+ not recognized)",
+            identity,
+        ):
+            continue
+        return identity
+    raise ValueError("O dispositivo não retornou um nome válido para o comando name.")
+
+
+def parse_device_commands(help_text: str) -> list[CommandSpec]:
+    commands: dict[str, CommandSpec] = {}
+
+    def add_command(name: str, argument_syntax: str = "") -> None:
+        name = name.lower()
+        if name in HELP_NON_COMMANDS:
+            return
+        spec = COMMAND_BY_NAME.get(name)
+        if spec is None:
+            confirmation = COMMAND_CONFIRMATIONS.get(name, "")
+            if not confirmation and name.startswith(
+                ("clear_", "delete_", "erase_", "remove_", "reset_", "set_")
+            ):
+                confirmation = f"Confirmar a execução de {name}?"
+            parameters = f"Argumento ({argument_syntax})" if argument_syntax else ""
+            spec = CommandSpec(
+                name,
+                "Firmware",
+                "Comando anunciado pelo dispositivo identificado.",
+                confirmation,
+                parameters,
+            )
+        commands.setdefault(name, spec)
+
+    for raw_line in help_text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("---"):
+            continue
+        if line.startswith("="):
+            line = line.lstrip("=- ").strip()
+        if not line or line.startswith("[") or line.startswith("---"):
+            continue
+        if line.startswith("> ") and not line.startswith("-> "):
+            continue
+        if re.match(r"(?i)^comandos?\b", line):
+            continue
+        if re.match(r"^[A-Za-z][A-Za-z0-9_]*\s*=", line):
+            continue
+
+        alias_line = re.match(r"(?i)^aliases:\s*(.*)$", line)
+        if alias_line:
+            for alias in re.findall(r"\b([A-Za-z][A-Za-z0-9_]*)\s*=", alias_line.group(1)):
+                add_command(alias)
+            continue
+
+        line = re.sub(r"^->\s*", "", line)
+        category_line = False
+        category = re.match(r"^([A-Za-zÀ-ÿ ]+):\s*(.*)$", line)
+        category_value = category.group(2).lstrip() if category else ""
+        if (
+            category
+            and category.group(1).strip().lower() in HELP_CATEGORIES
+            and not re.match(r"^[\d\[]", category_value)
+        ):
+            line = category.group(2)
+            category_line = True
+        elif category and " " in category.group(1).strip():
+            continue
+        elif re.match(r"(?i)^(?:canais|respostas):", line):
+            continue
+
+        line = re.sub(r"(?i)^ex(?:emplo)?\.?:\s*", "", line)
+        line = re.sub(
+            r"\b([A-Za-z][A-Za-z0-9_]*)\[(\d+)-(\d+)\](?=:\[[^\]]*\])",
+            lambda match: " / ".join(
+                f"{match.group(1)}{index}"
+                for index in range(int(match.group(2)), int(match.group(3)) + 1)
+            ),
+            line,
+        )
+        line = re.split(r"\s+[-–—]\s+", line, maxsplit=1)[0]
+        line = line.split(" (", maxsplit=1)[0].strip()
+        if not line or line[0].isdigit():
+            continue
+
+        # A colon followed by a space is prose (for example, "wifi_add: lista..."),
+        # not a parameterized command signature.
+        prose = re.match(r"^([A-Za-z][A-Za-z0-9_]*)\s*:\s+", line)
+        if prose and not category_line:
+            add_command(prose.group(1))
+            continue
+
+        matches = list(COMMAND_TOKEN.finditer(line))
+        if not matches:
+            continue
+        has_list_separators = (
+            "/" in line
+            or re.search(r",\s+", line) is not None
+            or re.search(r"\s+\|\s+", line) is not None
+        )
+        if not category_line and not has_list_separators:
+            match = matches[0]
+            argument_syntax = ""
+            if ":" in line:
+                argument_syntax = line.partition(":")[2].strip()
+            add_command(match.group(1), argument_syntax)
+            continue
+
+        for match in matches:
+            add_command(match.group(1), match.group(2) or "")
+
+    return sorted(commands.values(), key=lambda spec: (spec.group.lower(), spec.name))
+
+
+def fallback_device_commands(identity: str) -> list[CommandSpec]:
+    names = DEVICE_COMMANDS.get(identity)
+    if names is None:
+        return []
+
+    available = dict(COMMAND_BY_NAME)
+    available["name"] = CommandSpec(
+        "name", "Sistema", "Identifica o dispositivo."
+    )
+    available["sd_remount"] = CommandSpec(
+        "sd_remount", "SD", "Remonta o cartão SD."
+    )
+    return [available[name] for name in names if name in available]
 
 
 def build_payload(
@@ -127,6 +302,10 @@ def build_payload(
 ) -> str:
     if spec.name.startswith("sd_") and spec.parameters:
         arg = sd_arg.strip()
+        if spec.name == "sd_list" and not arg:
+            arg = "/"
+        if not arg:
+            raise ValueError(f"Informe o argumento do comando {spec.name}.")
         if not arg.startswith("/") or ".." in arg:
             raise ValueError("O argumento SD deve começar com / (ex.: /log.txt).")
         return f"{spec.name}:{arg}"
@@ -166,6 +345,12 @@ def build_payload(
             raise ValueError("O intervalo deve estar entre 50 e 60000 ms.")
         return f"led_blink:{interval}"
 
+    argument = sd_arg.strip()
+    if spec.parameters and argument:
+        return f"{spec.name}:{argument}"
+    if spec.parameters and spec.name not in COMMAND_BY_NAME and "[" not in spec.parameters:
+        raise ValueError(f"Informe {spec.parameters.lower()} para executar {spec.name}.")
+
     return spec.name
 
 
@@ -201,7 +386,7 @@ def exchange_udp(
     return "".join(response_parts)
 
 
-def exchange_serial(device, payload: str, timeout: float) -> str:
+def exchange_serial(device, payload: str, timeout: float, *, require_echo: bool = True) -> str:
     """Mantém a porta aberta e envia LF, conforme o receptor do firmware."""
     device.reset_input_buffer()
     packet = payload.encode("utf-8") + b"\n"
@@ -221,7 +406,7 @@ def exchange_serial(device, payload: str, timeout: float) -> str:
             if payload == "clima_sync":
                 complete = b"Clima Atualizado ->" in normalized or b"Falha ao atualizar clima:" in normalized
             else:
-                complete = echo in normalized
+                complete = not require_echo or echo in normalized
             if complete:
                 break
     return parts.decode("utf-8", errors="replace")
@@ -230,7 +415,7 @@ def exchange_serial(device, payload: str, timeout: float) -> str:
 class CommandTester:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("ESP32 - Testador de comandos UDP / Serial")
+        self.root.title("ESP32 - Testador de comandos UDP / Serial / Bluetooth")
         self.serial_connection = None
         self.serial_key = None
         self.root.protocol("WM_DELETE_WINDOW", self._close)
@@ -240,6 +425,7 @@ class CommandTester:
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.worker: threading.Thread | None = None
         self.selected_spec: CommandSpec | None = None
+        self.available_commands = list(COMMANDS)
 
         self.transport_var = tk.StringVar(value="UDP")
         self.serial_port_var = tk.StringVar()
@@ -249,12 +435,13 @@ class CommandTester:
         self.timeout_var = tk.StringVar(value=str(DEFAULT_TIMEOUT))
         self.search_var = tk.StringVar()
         self.command_var = tk.StringVar()
+        self.device_var = tk.StringVar(value="Dispositivo não identificado — lista geral")
         self.timezone_var = tk.StringVar(value="-3")
         self.pulses_var = tk.StringVar(value="3")
         self.pulse_interval_var = tk.StringVar(value="250")
         self.blink_interval_var = tk.StringVar(value="500")
-        self.sd_arg_var = tk.StringVar(value="/")
-        self.status_var = tk.StringVar(value="Escolha UDP ou Serial e configure a conexão.")
+        self.sd_arg_var = tk.StringVar()
+        self.status_var = tk.StringVar(value="Escolha UDP, Serial ou Bluetooth e configure a conexão.")
 
         self._build_ui()
         self.search_var.trace_add("write", lambda *_: self._populate_commands())
@@ -265,7 +452,7 @@ class CommandTester:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(2, weight=1)
 
-        connection = ttk.LabelFrame(self.root, text="Conexão UDP / Serial")
+        connection = ttk.LabelFrame(self.root, text="Conexão UDP / Serial / Bluetooth SPP")
         connection.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
         connection.columnconfigure(1, weight=1)
         ttk.Label(connection, text="IP / hostname:").grid(row=0, column=0, padx=6, pady=6)
@@ -282,9 +469,9 @@ class CommandTester:
         )
 
         ttk.Label(connection, text="Transporte:").grid(row=1, column=0, padx=6, pady=6)
-        ttk.Combobox(connection, textvariable=self.transport_var, values=("UDP", "Serial"),
-                     state="readonly", width=10).grid(row=1, column=1, sticky="w", padx=6)
-        ttk.Label(connection, text="Porta serial:").grid(row=1, column=2, padx=6)
+        ttk.Combobox(connection, textvariable=self.transport_var, values=("UDP", "Serial", "Bluetooth"),
+                     state="readonly", width=12).grid(row=1, column=1, sticky="w", padx=6)
+        ttk.Label(connection, text="Porta serial / BT:").grid(row=1, column=2, padx=6)
         self.serial_ports = ttk.Combobox(connection, textvariable=self.serial_port_var, width=18)
         self.serial_ports.grid(row=1, column=3, padx=6)
         ttk.Label(connection, text="Baud:").grid(row=1, column=4, padx=6)
@@ -293,6 +480,15 @@ class CommandTester:
             row=2, column=0, columnspan=2, sticky="w", padx=6, pady=4)
         ttk.Label(connection, text="Serial: feche o Monitor Serial da IDE. Instalação: python -m pip install pyserial").grid(
             row=2, column=2, columnspan=4, sticky="w", padx=6, pady=4)
+        controls = ttk.Frame(connection)
+        controls.grid(row=3, column=0, columnspan=2, sticky="w", padx=6, pady=4)
+        self.connect_button = ttk.Button(controls, text="Conectar serial / BT", command=self._connect)
+        self.connect_button.pack(side=tk.LEFT)
+        self.disconnect_button = ttk.Button(controls, text="Desconectar", command=self._disconnect)
+        self.disconnect_button.pack(side=tk.LEFT, padx=6)
+        ttk.Label(connection, text="Bluetooth: pareie Central-ESP32 no sistema e selecione a COM de saída.\n"
+                  "Não é BLE. No Linux, use a porta SPP vinculada (ex.: /dev/rfcomm0).").grid(
+            row=3, column=2, columnspan=4, sticky="w", padx=6, pady=4)
         self._refresh_ports()
 
         body = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
@@ -303,15 +499,23 @@ class CommandTester:
         details_panel = ttk.LabelFrame(body, text="Executar comando")
         body.add(command_panel, weight=1)
         body.add(details_panel, weight=2)
-        command_panel.rowconfigure(1, weight=1)
         command_panel.columnconfigure(0, weight=1)
         details_panel.columnconfigure(1, weight=1)
 
         ttk.Entry(command_panel, textvariable=self.search_var).grid(
             row=0, column=0, sticky="ew", padx=6, pady=6
         )
+        ttk.Button(
+            command_panel,
+            text="Identificar dispositivo",
+            command=self._identify_device,
+        ).grid(row=0, column=1, sticky="e", padx=6, pady=6)
+        ttk.Label(command_panel, textvariable=self.device_var, anchor=tk.W).grid(
+            row=1, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 4)
+        )
+        command_panel.rowconfigure(2, weight=1)
         self.command_list = tk.Listbox(command_panel, exportselection=False)
-        self.command_list.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
+        self.command_list.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=6, pady=(0, 6))
         self.command_list.bind("<<ListboxSelect>>", self._select_command)
 
         self.description_label = ttk.Label(
@@ -348,7 +552,7 @@ class CommandTester:
             row=3, column=1, sticky="w", padx=8, pady=4
         )
 
-        ttk.Label(details_panel, text="Argumento (SD / IP):").grid(
+        ttk.Label(details_panel, text="Argumento do comando:").grid(
             row=4, column=0, sticky="w", padx=8, pady=4
         )
         ttk.Entry(details_panel, textvariable=self.sd_arg_var).grid(
@@ -395,9 +599,10 @@ class CommandTester:
     def _populate_commands(self) -> None:
         search = self.search_var.get().strip().lower()
         self.command_list.delete(0, tk.END)
+        self.selected_spec = None
         self.visible_commands = [
             command
-            for command in COMMANDS
+            for command in self.available_commands
             if search in command.name.lower()
             or search in command.group.lower()
             or search in command.description.lower()
@@ -408,6 +613,44 @@ class CommandTester:
                 tk.END,
                 f"{command.group}  |  {command.name}{marker}",
             )
+
+    def _identify_device(self) -> None:
+        try:
+            connection = self._connection_values()
+        except ValueError as exc:
+            messagebox.showerror("Dados inválidos", str(exc))
+            return
+        self._start_worker(lambda: self._discover_device(connection))
+
+    def _discover_device(
+        self,
+        connection: tuple[str, str, int, float],
+    ) -> None:
+        try:
+            name_response = self._exchange(connection, "name")
+            identity = parse_device_identity(name_response)
+            help_text = self._exchange(connection, "help")
+            commands = parse_device_commands(help_text)
+            if not commands:
+                commands = fallback_device_commands(identity)
+                if not commands:
+                    raise ValueError(
+                        f"Dispositivo identificado como {identity}, mas a resposta help "
+                        "não apresentou comandos reconhecíveis nem há lista local para ele."
+                    )
+                self.events.put((
+                    "log",
+                    f"AVISO: help sem comandos reconhecíveis; usando a lista cadastrada para {identity}.",
+                ))
+        except (OSError, ValueError) as exc:
+            self.events.put(("identify_failed", None))
+            self.events.put(("log", f"ERRO ao identificar dispositivo: {exc}"))
+            self.events.put(("status", "Não foi possível carregar os comandos do dispositivo."))
+            return
+
+        self.events.put(("commands", (identity, commands)))
+        self.events.put(("log", f"Dispositivo identificado: {identity} ({len(commands)} comandos)."))
+        self.events.put(("status", f"{len(commands)} comandos carregados para {identity}."))
 
     def _select_command(self, _event: tk.Event[tk.Misc] | None = None) -> None:
         selection = self.command_list.curselection()
@@ -442,12 +685,14 @@ class CommandTester:
             raise ValueError("Timeout deve ser numérico.") from exc
         if not 0.2 <= timeout <= 120:
             raise ValueError("O timeout deve estar entre 0,2 e 120 segundos.")
-        if mode == "Serial":
+        if mode not in ("UDP", "Serial", "Bluetooth"):
+            raise ValueError("Selecione UDP, Serial ou Bluetooth.")
+        if mode in ("Serial", "Bluetooth"):
             if serial is None:
                 raise ValueError("Instale a dependência: python -m pip install pyserial")
             host = self.serial_port_var.get().strip()
             if not host:
-                raise ValueError("Selecione ou digite a porta serial (ex.: COM5).")
+                raise ValueError("Selecione a porta serial ou a COM Bluetooth de saída (ex.: COM5).")
             try:
                 port = int(self.baud_var.get())
             except ValueError as exc:
@@ -466,19 +711,12 @@ class CommandTester:
                 raise ValueError("A porta deve estar entre 1 e 65535.")
         return mode, host, port, timeout
 
-    def _exchange(self, connection: tuple[str, str, int, float], payload: str) -> str:
-        mode, host, port, timeout = connection
-        if payload == "clima_sync":
-            timeout = max(timeout, 35.0)
-        if mode == "UDP":
-            return exchange_udp(host, port, payload, timeout)
-        data = payload.encode("utf-8")
-        if b"\r" in data or b"\n" in data or len(data) > 256:
-            raise ValueError("Serial aceita uma linha de até 256 bytes por comando.")
+    def _open_serial(self, host: str, port: int) -> None:
+        if serial is None:
+            raise ValueError("Instale a dependência: python -m pip install pyserial")
         key = (host, port)
         if self.serial_connection is None or self.serial_key != key or not self.serial_connection.is_open:
-            if self.serial_connection is not None:
-                self.serial_connection.close()
+            self._disconnect_serial()
             device = serial.Serial(port=None, baudrate=port, timeout=0.05, write_timeout=2)
             # Evita solicitar reset por DTR/RTS ao abrir a porta.
             device.dtr = False
@@ -487,12 +725,57 @@ class CommandTester:
             device.open()
             self.serial_connection = device
             self.serial_key = key
-        try:
-            return exchange_serial(self.serial_connection, payload, timeout)
-        except OSError:
+
+    def _disconnect_serial(self) -> None:
+        if self.serial_connection is not None:
             self.serial_connection.close()
             self.serial_connection = None
             self.serial_key = None
+
+    def _connect(self) -> None:
+        try:
+            connection = self._connection_values()
+            if connection[0] == "UDP":
+                raise ValueError("UDP não precisa de conexão. Escolha Serial ou Bluetooth.")
+        except ValueError as exc:
+            messagebox.showerror("Dados inválidos", str(exc))
+            return
+        self._start_worker(lambda: self._change_connection(connection))
+
+    def _disconnect(self) -> None:
+        self._start_worker(lambda: self._change_connection(None))
+
+    def _change_connection(self, connection: tuple[str, str, int, float] | None) -> None:
+        try:
+            if connection is None:
+                self._disconnect_serial()
+                message = "Porta serial / Bluetooth desconectada."
+            else:
+                mode, host, port, _ = connection
+                self._open_serial(host, port)
+                message = f"{mode} conectado em {host}. Envie help para testar o firmware."
+        except (OSError, ValueError) as exc:
+            self.events.put(("log", f"ERRO de conexão: {exc}"))
+            self.events.put(("status", "Falha na conexão; verifique o pareamento e a porta de saída."))
+            return
+        self.events.put(("log", message))
+        self.events.put(("status", message))
+
+    def _exchange(self, connection: tuple[str, str, int, float], payload: str) -> str:
+        mode, host, port, timeout = connection
+        if payload == "clima_sync":
+            timeout = max(timeout, 35.0)
+        if mode == "UDP":
+            return exchange_udp(host, port, payload, timeout)
+        data = payload.encode("utf-8")
+        limit = 255 if mode == "Bluetooth" else 256
+        if b"\r" in data or b"\n" in data or not data or len(data) > limit:
+            raise ValueError(f"{mode} aceita uma linha não vazia de até {limit} bytes por comando.")
+        self._open_serial(host, port)
+        try:
+            return exchange_serial(self.serial_connection, payload, timeout, require_echo=mode != "Bluetooth")
+        except OSError:
+            self._disconnect_serial()
             raise
 
     def _command_payload(self, spec: CommandSpec) -> str:
@@ -527,17 +810,18 @@ class CommandTester:
         except ValueError as exc:
             messagebox.showerror("Dados inválidos", str(exc))
             return
-        self._start_worker(
-            lambda: self._send_one(connection, spec, payload)
-        )
+        self._start_worker(lambda: self._send_one(connection, payload))
 
     def _send_custom(self) -> None:
         payload = self.command_var.get().strip()
         if not payload:
             messagebox.showinfo("Comando personalizado", "Digite o comando.")
             return
-        command_name = payload.partition(":")[0]
-        spec = COMMAND_BY_NAME.get(command_name)
+        command_name = payload.partition(":")[0].lower()
+        spec = next(
+            (command for command in self.available_commands if command.name == command_name),
+            COMMAND_BY_NAME.get(command_name),
+        )
         if spec and not self._confirm(spec):
             return
         try:
@@ -545,22 +829,22 @@ class CommandTester:
         except ValueError as exc:
             messagebox.showerror("Dados inválidos", str(exc))
             return
-        self._start_worker(lambda: self._send_one(connection, None, payload))
+        self._start_worker(lambda: self._send_one(connection, payload))
 
     def _send_one(
         self,
         connection: tuple[str, str, int, float],
-        spec: CommandSpec | None,
         payload: str,
     ) -> None:
-        mode, host, port, timeout = connection
-        self.events.put(("status", f"Enviando {payload} via {mode} para {host}:{port}..."))
+        mode, host, port, _ = connection
+        destination = f"{host}:{port}" if mode == "UDP" else host
+        self.events.put(("status", f"Enviando {payload} via {mode} para {destination}..."))
         self.events.put(("log", f">>> {payload}"))
         try:
             response = self._exchange(connection, payload)
         except (OSError, ValueError) as exc:
             self.events.put(("log", f"ERRO de comunicação: {exc}"))
-            self.events.put(("status", "Falha na comunicação. Na serial, verifique a porta e feche outros monitores."))
+            self.events.put(("status", "Falha na comunicação. Verifique a porta, o pareamento Bluetooth e feche outros monitores."))
             return
 
         if response:
@@ -575,8 +859,9 @@ class CommandTester:
             connection = self._connection_values()
             payloads = [
                 (spec, self._command_payload(spec))
-                for spec in COMMANDS
+                for spec in self.available_commands
                 if not spec.confirmation
+                and (spec.name in COMMAND_BY_NAME or not spec.parameters)
             ]
         except ValueError as exc:
             messagebox.showerror("Dados inválidos", str(exc))
@@ -588,10 +873,9 @@ class CommandTester:
         connection: tuple[str, str, int, float],
         payloads: list[tuple[CommandSpec, str]],
     ) -> None:
-        mode, host, port, timeout = connection
-        skipped = len(COMMANDS) - len(payloads)
+        skipped = len(self.available_commands) - len(payloads)
         self.events.put(("status", f"Executando {len(payloads)} comandos seguros; "
-                                   f"{skipped} protegidos por confirmação serão ignorados."))
+                                   f"{skipped} protegidos ou sem argumento serão ignorados."))
         self.events.put(("log", f"=== LOTE: {len(payloads)} comandos ==="))
 
         for index, (spec, payload) in enumerate(payloads, start=1):
@@ -626,6 +910,8 @@ class CommandTester:
         self.send_button.configure(state=state)
         self.raw_button.configure(state=state)
         self.all_button.configure(state=state)
+        self.connect_button.configure(state=state)
+        self.disconnect_button.configure(state=state)
 
     def _process_events(self) -> None:
         while True:
@@ -641,6 +927,15 @@ class CommandTester:
                 self.output.insert(tk.END, f"{value}\n")
                 self.output.see(tk.END)
                 self.output.configure(state=tk.DISABLED)
+            elif event == "commands":
+                identity, commands = value
+                self.available_commands = commands
+                self.device_var.set(f"Dispositivo identificado: {identity}")
+                self._populate_commands()
+            elif event == "identify_failed":
+                self.available_commands = list(COMMANDS)
+                self.device_var.set("Dispositivo não identificado — lista geral")
+                self._populate_commands()
 
         if self.worker and not self.worker.is_alive():
             self._set_buttons_enabled(True)
@@ -652,7 +947,7 @@ def main() -> None:
     parser.add_argument(
         "--list",
         action="store_true",
-        help="lista os comandos reconhecidos pelo firmware atual e encerra",
+        help="lista os comandos gerais cadastrados (sem identificar um dispositivo) e encerra",
     )
     args = parser.parse_args()
 
